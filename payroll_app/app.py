@@ -47,6 +47,7 @@ INT_RE = re.compile(r"^-?\d+$")
 
 ORIGINAL_FIELDS = ["薪资单号", "成本中心", "金额分"]
 ADJUST_FIELDS = ["勘误号", "薪资单号", "成本中心", "金额分"]
+ENTITY_MAP_FIELDS = ["成本中心", "法人"]
 
 
 class ValidationError(Exception):
@@ -55,6 +56,14 @@ class ValidationError(Exception):
 
 class ConflictError(Exception):
     """业务状态冲突（封账、重复、幂等冲突等）。"""
+
+
+class PublishError(Exception):
+    """发布校验失败：携带全部受影响流水的说明，整月不发布。"""
+
+    def __init__(self, errors):
+        self.errors = list(errors)
+        super().__init__("；".join(self.errors[:5]))
 
 
 # --------------------------------------------------------------------- DB
@@ -122,6 +131,21 @@ CREATE TABLE IF NOT EXISTS slip_revisions (
     mode         TEXT NOT NULL,
     entry_month  TEXT NOT NULL,
     created_at   TEXT NOT NULL
+);
+
+-- 按法人发布：每月最多一份，主键保证并发发布只有一份生效
+CREATE TABLE IF NOT EXISTS publications (
+    month        TEXT PRIMARY KEY,               -- 入账月 YYYY-MM
+    published_at TEXT NOT NULL,
+    row_count    INTEGER NOT NULL,
+    csv_body     TEXT NOT NULL                   -- 入仓 CSV 全文，重传对照也原样返回
+);
+
+-- 已发布流水逐行的法人结果：跨月冲回沿用它
+CREATE TABLE IF NOT EXISTS publication_rows (
+    posting_id   INTEGER PRIMARY KEY,            -- 对应 postings.id
+    entry_month  TEXT NOT NULL,
+    legal_entity TEXT NOT NULL
 );
 
 -- 数据库层防线：已封月明细不可插入/修改/删除
@@ -233,6 +257,17 @@ def _norm_id(value, field):
         raise ValidationError(f"{field}过长（最多 64 字符）")
     if any(ch in value for ch in "\t\r\n,，\u0000"):
         raise ValidationError(f"{field}含非法字符：{value!r}")
+    return value
+
+
+def _norm_entity(value):
+    value = (value or "").strip()
+    if not value:
+        raise ValidationError("法人不能为空")
+    if len(value) > 64:
+        raise ValidationError(f"法人名称过长（最多 64 字符）：{value!r}")
+    if any(ch in value for ch in "\t\r\n,，\u0000"):
+        raise ValidationError(f"法人名称含非法字符：{value!r}")
     return value
 
 
@@ -379,6 +414,39 @@ def parse_adjustment_csv(text):
     if not rows:
         raise ValidationError("CSV 中没有有效数据行")
     return rows
+
+
+def parse_entity_map_csv(text):
+    """表头：成本中心,法人。整份文件先校验，任一错误则全部拒绝。
+
+    返回 {成本中心: 法人}。成本中心在文件内必须唯一。
+    """
+    if not text.strip():
+        raise ValidationError("CSV 内容为空")
+    reader = csv.reader(io.StringIO(text))
+    _read_header(reader, ENTITY_MAP_FIELDS)
+    mapping, errors = {}, []
+    for lineno, raw in enumerate(reader, start=2):
+        if not raw or all(c.strip() == "" for c in raw):
+            continue
+        if len(raw) != len(ENTITY_MAP_FIELDS):
+            errors.append(f"第 {lineno} 行列数为 {len(raw)}，应为 {len(ENTITY_MAP_FIELDS)}")
+            continue
+        try:
+            center = _norm_center(raw[0])
+            entity = _norm_entity(raw[1])
+        except ValidationError as exc:
+            errors.append(f"第 {lineno} 行：{exc}")
+            continue
+        if center in mapping:
+            errors.append(f"第 {lineno} 行：成本中心 {center} 在文件内重复")
+            continue
+        mapping[center] = entity
+    if errors:
+        raise ValidationError("；".join(errors))
+    if not mapping:
+        raise ValidationError("CSV 中没有有效数据行")
+    return mapping
 
 
 # ------------------------------------------------------------------ 原单导入
@@ -611,6 +679,137 @@ def export_csv(conn, month):
     return buf.getvalue()
 
 
+# ------------------------------------------------------------------ 按法人发布
+
+def get_publication(conn, month):
+    return conn.execute(
+        "SELECT * FROM publications WHERE month=?", (month,)).fetchone()
+
+
+def _find_source_posting(conn, slip_no, revision):
+    """冲回的来源：同一薪资单上一修订的原始或重入账流水（正常数据恰一条）。"""
+    return conn.execute(
+        "SELECT * FROM postings WHERE slip_no=? AND kind IN ('original','rebook')"
+        " AND revision=? ORDER BY id",
+        (slip_no, revision),
+    ).fetchall()
+
+
+def _assign_entities(conn, month, rows, mapping):
+    """为 month 的每条流水分配法人，返回 (assignments, errors)。
+
+    - 原始/重入账：查当月对照；
+    - 冲回：沿用同一薪资单上一修订原始/重入账流水的法人——
+      同月取本次分配，跨月取较早入账月已发布的结果。
+    任一规则不满足都记入 errors（指出受影响流水），调用方整月不发布。
+    rows 按 id 升序处理，同月来源（先入账）一定已经分配过。
+    """
+    assignments = {}
+    errors = []
+    for r in rows:
+        label = (f"#{r['id']} {r['slip_no']}（{KIND_LABELS.get(r['kind'], r['kind'])}，"
+                 f"{r['cost_center']}，{r['amount_cents']} 分）")
+        if r["kind"] in (KIND_ORIGINAL, KIND_REBOOK):
+            entity = mapping.get(r["cost_center"])
+            if entity is None:
+                errors.append(f"{label}：成本中心 {r['cost_center']} 不在当月对照中")
+            else:
+                assignments[r["id"]] = entity
+            continue
+        # 冲回：找上一修订的原始/重入账流水
+        src_rows = _find_source_posting(conn, r["slip_no"], r["revision"] - 1)
+        if len(src_rows) != 1:
+            errors.append(
+                f"{label}：上一修订（{r['revision'] - 1}）的原始/重入账流水缺失或不唯一")
+            continue
+        src = src_rows[0]
+        if src["entry_month"] > month:
+            errors.append(
+                f"{label}：来源流水 #{src['id']} 入账月 {src['entry_month']} 晚于本月")
+            continue
+        if src["entry_month"] == month:
+            entity = assignments.get(src["id"])
+            if entity is None:
+                errors.append(f"{label}：同月来源流水 #{src['id']} 未能分配法人")
+                continue
+        else:
+            pub = conn.execute(
+                "SELECT legal_entity FROM publication_rows WHERE posting_id=?",
+                (src["id"],)).fetchone()
+            if pub is None:
+                errors.append(
+                    f"{label}：来源流水 #{src['id']} 所在入账月 "
+                    f"{src['entry_month']} 尚未发布")
+                continue
+            entity = pub["legal_entity"]
+        assignments[r["id"]] = entity
+    return assignments, errors
+
+
+def _warehouse_csv(rows, assignments):
+    """入仓 CSV：保留原流水字段，追加一列法人。"""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["入账月", "薪资单号", "薪资所属月", "流水类型", "成本中心",
+                     "金额分", "勘误号", "修订号", "法人"])
+    for r in rows:
+        writer.writerow([
+            r["entry_month"], r["slip_no"], r["slip_month"],
+            KIND_LABELS.get(r["kind"], r["kind"]),
+            r["cost_center"], r["amount_cents"], r["adjust_no"] or "",
+            r["revision"], assignments[r["id"]],
+        ])
+    return buf.getvalue()
+
+
+def publish_month(conn, month, map_text):
+    """上传当月“成本中心,法人”对照并发布已封账月份。单事务。
+
+    返回 (status, payload)：
+    - "published"：首次发布成功，payload 含 published_at / row_count / csv_body；
+    - "already"：该月已发布过，payload 为已发布记录（重传对照不重新计算）。
+    校验失败抛 PublishError（整月不发布，库保持不变）。
+    """
+    month = _norm_month(month, "发布月份")
+    mapping = parse_entity_map_csv(map_text)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = get_month(conn, month)
+        if row is None:
+            raise ValidationError(f"月份 {month} 不存在")
+        if row["status"] != "closed":
+            raise ConflictError(f"月份 {month} 尚未封账，封账后才能发布")
+        existing = get_publication(conn, month)
+        if existing is not None:
+            conn.execute("COMMIT")
+            return "already", existing
+        rows = month_rows(conn, month)
+        assignments, errors = _assign_entities(conn, month, rows, mapping)
+        if errors:
+            raise PublishError(errors)
+        csv_body = _warehouse_csv(rows, assignments)
+        now = _now()
+        conn.execute(
+            "INSERT INTO publications(month, published_at, row_count, csv_body)"
+            " VALUES (?,?,?,?)",
+            (month, now, len(rows), csv_body),
+        )
+        conn.executemany(
+            "INSERT INTO publication_rows(posting_id, entry_month, legal_entity)"
+            " VALUES (?,?,?)",
+            [(r["id"], month, assignments[r["id"]]) for r in rows],
+        )
+        conn.execute("COMMIT")
+        return "published", {
+            "month": month, "published_at": now,
+            "row_count": len(rows), "csv_body": csv_body,
+        }
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 # ------------------------------------------------------------------ 应用
 
 def create_app(db_path=None, testing=False):
@@ -738,6 +937,66 @@ def create_app(db_path=None, testing=False):
             info=get_month(conn, month),
             rows=month_rows(conn, month),
             labels=KIND_LABELS,
+            publication=get_publication(conn, month),
+        )
+
+    @app.post("/month/<month>/publish")
+    def publish(month):
+        conn = get_db()
+        upload = request.files.get("file")
+        try:
+            if upload is None or not upload.filename:
+                raise ValidationError("请选择对照 CSV 文件")
+            text = upload.read().decode("utf-8-sig")
+            status, info = publish_month(conn, month, text)
+        except PublishError as exc:
+            flash(f"发布失败，整月未发布：{len(exc.errors)} 条流水受影响", "error")
+            for msg in exc.errors[:10]:
+                flash(msg, "detail")
+            if len(exc.errors) > 10:
+                flash(f"……另有 {len(exc.errors) - 10} 条流水受影响", "detail")
+            return redirect(url_for("month_detail", month=month))
+        except (ValidationError, ConflictError, sqlite3.IntegrityError) as exc:
+            flash(f"发布失败：{exc}", "error")
+            return redirect(url_for("month_detail", month=month))
+        except UnicodeDecodeError:
+            flash("发布失败：文件必须为 UTF-8 编码", "error")
+            return redirect(url_for("month_detail", month=month))
+        if status == "already":
+            # 首次发布后，重传对照只提供已发布的文件
+            return Response(
+                info["csv_body"],
+                mimetype="text/csv; charset=utf-8",
+                headers={
+                    "Content-Disposition":
+                        f'attachment; filename="warehouse-{month}.csv"'
+                },
+            )
+        flash(
+            f"月份 {month} 已发布：{info['row_count']} 条流水完成法人分配，"
+            "可下载入仓 CSV",
+            "ok",
+        )
+        return redirect(url_for("month_detail", month=month))
+
+    @app.get("/month/<month>/warehouse.csv")
+    def warehouse_csv(month):
+        conn = get_db()
+        try:
+            month = _norm_month(month, "月份")
+        except ValidationError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("index"))
+        pub = get_publication(conn, month)
+        if pub is None:
+            flash(f"月份 {month} 尚未发布，没有入仓 CSV", "error")
+            return redirect(url_for("month_detail", month=month))
+        return Response(
+            pub["csv_body"],
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="warehouse-{month}.csv"'
+            },
         )
 
     @app.get("/export/<month>.csv")

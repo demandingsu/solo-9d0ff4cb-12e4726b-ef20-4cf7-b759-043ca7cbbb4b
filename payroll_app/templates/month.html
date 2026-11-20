@@ -36,4 +36,43 @@
     </tbody>
   </table>
 </section>
+
+{% if info.status == 'closed' %}
+<section class="card">
+  <h2>按法人发布
+    {% if publication %}<span class="badge closed">已发布</span>{% endif %}
+  </h2>
+  {% if publication %}
+    <p>
+      该月已于 <span class="mono">{{ publication.published_at }}</span> 发布，
+      共 {{ publication.row_count }} 条流水。
+      <a class="btn small" href="{{ url_for('warehouse_csv', month=month) }}">下载入仓 CSV</a>
+    </p>
+    <details>
+      <summary class="hint">重传对照</summary>
+      <form method="post" action="{{ url_for('publish', month=month) }}"
+            enctype="multipart/form-data">
+        <label>对照 CSV（表头：成本中心,法人）
+          <input type="file" name="file" accept=".csv,text/csv" required>
+        </label>
+        <button type="submit">重传对照</button>
+      </form>
+      <p class="hint">该月已发布：重传不会重新计算，提交后只会得到已发布的文件。</p>
+    </details>
+  {% else %}
+    <form method="post" action="{{ url_for('publish', month=month) }}"
+          enctype="multipart/form-data">
+      <label>对照 CSV（表头：成本中心,法人）
+        <input type="file" name="file" accept=".csv,text/csv" required>
+      </label>
+      <button type="submit">上传对照并发布</button>
+    </form>
+    <p class="hint">
+      原始/重入账流水按当月对照分配法人；冲回沿用同一薪资单上一修订原始/重入账流水的法人
+      （同月取本次分配，跨月取较早入账月已发布的结果）。
+      对照或来源缺失、来源晚于本月时，将列出受影响流水并整月不发布。
+    </p>
+  {% endif %}
+</section>
+{% endif %}
 {% endblock %}

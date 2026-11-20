@@ -14,6 +14,7 @@ from payroll_app import app as appmod  # noqa: E402
 
 ORIG_HEADER = "薪资单号,成本中心,金额分\n"
 ADJ_HEADER = "勘误号,薪资单号,成本中心,金额分\n"
+MAP_HEADER = "成本中心,法人\n"
 
 
 @pytest.fixture()
@@ -62,6 +63,21 @@ def slip(db, no):
 
 def open_close(client, month):
     return client.post("/months/close", data={"month": month}, follow_redirects=True)
+
+
+def publish(client, month, body):
+    return client.post(
+        f"/month/{month}/publish",
+        data={"file": (io.BytesIO(body.encode("utf-8")), "map.csv")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+
+def warehouse_lines(client, month):
+    resp = client.get(f"/month/{month}/warehouse.csv")
+    assert resp.status_code == 200
+    return resp.data.decode("utf-8").strip().splitlines()
 
 
 def add_month(client, month):
@@ -552,3 +568,244 @@ def test_import_same_slip_in_new_month_rejected(client):
     resp = post_csv(client, "/import/originals", "2027-01", ORIG_HEADER + "S1,CC-A,1000\n")
     assert "已存在" in resp.data.decode("utf-8")
     assert postings(client.db_path, "2027-01") == []
+
+
+# --------------------------------------------------------------- 按法人发布
+
+def test_publish_closed_month_appends_entity_column(client):
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12",
+             ORIG_HEADER + "S1,CC-A,1000\nS2,CC-B,2500\n")
+    open_close(client, "2026-12")
+    resp = publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\nCC-B,乙公司\n")
+    assert "已发布" in resp.data.decode("utf-8")
+
+    lines = warehouse_lines(client, "2026-12")
+    assert lines[0] == "入账月,薪资单号,薪资所属月,流水类型,成本中心,金额分,勘误号,修订号,法人"
+    assert lines[1] == "2026-12,S1,2026-12,原始,CC-A,1000,,0,甲公司"
+    assert lines[2] == "2026-12,S2,2026-12,原始,CC-B,2500,,0,乙公司"
+    pub = q(client.db_path, "SELECT * FROM publications")[0]
+    assert pub["month"] == "2026-12" and pub["row_count"] == 2
+    assert len(q(client.db_path, "SELECT * FROM publication_rows")) == 2
+
+
+def test_publish_open_month_rejected(client):
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    resp = publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\n")
+    assert "尚未封账" in resp.data.decode("utf-8")
+    assert q(client.db_path, "SELECT * FROM publications") == []
+
+
+def test_month_detail_shows_publish_entry_only_when_closed(client):
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    assert "上传对照并发布" not in client.get("/month/2026-12").data.decode("utf-8")
+    open_close(client, "2026-12")
+    assert "上传对照并发布" in client.get("/month/2026-12").data.decode("utf-8")
+
+
+def test_publish_missing_mapping_blocks_whole_month_then_retry(client):
+    """对照缺项：指出受影响流水、整月不发布；补齐后重试成功。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12",
+             ORIG_HEADER + "S1,CC-A,1000\nS2,CC-B,2500\n")
+    open_close(client, "2026-12")
+    resp = publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\n")
+    text = resp.data.decode("utf-8")
+    assert "整月未发布" in text and "S2" in text and "CC-B" in text
+    assert q(client.db_path, "SELECT * FROM publications") == []
+    assert q(client.db_path, "SELECT * FROM publication_rows") == []
+    # 未发布时下载不到入仓 CSV
+    resp = client.get("/month/2026-12/warehouse.csv", follow_redirects=True)
+    assert "尚未发布" in resp.data.decode("utf-8")
+    # 补齐缺项后重试
+    resp = publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\nCC-B,乙公司\n")
+    assert "已发布" in resp.data.decode("utf-8")
+    assert len(warehouse_lines(client, "2026-12")) == 3
+
+
+def test_entity_map_csv_validation(client):
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    resp = publish(client, "2026-12", "法人,成本中心\n甲公司,CC-A\n")
+    assert "表头" in resp.data.decode("utf-8")
+    resp = publish(client, "2026-12", MAP_HEADER + "CC-A,\n")
+    assert "法人不能为空" in resp.data.decode("utf-8")
+    resp = publish(client, "2026-12", MAP_HEADER + "CC-A,甲\nCC-A,乙\n")
+    assert "重复" in resp.data.decode("utf-8")
+    resp = publish(client, "2026-12", MAP_HEADER + "CC A,甲\n")
+    assert "成本中心" in resp.data.decode("utf-8")
+    assert q(client.db_path, "SELECT * FROM publications") == []
+
+
+def test_publish_cross_month_reverse_keeps_earlier_published_entity(client):
+    """跨月换法人：新月对照把 CC-A 改挂乙公司，冲回仍沿用 12 月已发布的甲公司。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\n")
+
+    add_month(client, "2027-01")
+    post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+    open_close(client, "2027-01")
+    publish(client, "2027-01", MAP_HEADER + "CC-A,乙公司\nCC-B,丙公司\n")
+
+    lines = warehouse_lines(client, "2027-01")
+    rev = [ln for ln in lines if ",冲回," in ln][0]
+    reb = [ln for ln in lines if ",重入账," in ln][0]
+    assert rev.endswith(",甲公司")   # 沿用较早入账月已发布结果，不取当月对照的乙公司
+    assert reb.endswith(",丙公司")   # 重入账用当月对照
+
+
+def test_publish_same_month_consecutive_adjustments(client):
+    """同月连续勘误：后一次冲回的来源是同月的重入账，取本次分配。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\n")
+
+    add_month(client, "2027-01")
+    post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+    post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A2,S1,CC-C,900\n")
+    open_close(client, "2027-01")
+    publish(client, "2027-01", MAP_HEADER + "CC-A,不用\nCC-B,乙公司\nCC-C,丙公司\n")
+
+    lines = warehouse_lines(client, "2027-01")[1:]
+    assert [ln.rsplit(",", 1)[1] for ln in lines] == [
+        "甲公司",   # 冲回 rev1：跨月来源 original，取 12 月已发布结果
+        "乙公司",   # 重入账 rev1：当月对照 CC-B
+        "乙公司",   # 冲回 rev2：同月来源 rebook rev1，取本次分配
+        "丙公司",   # 重入账 rev2：当月对照 CC-C
+    ]
+
+
+def test_publish_blocks_when_source_month_unpublished(client):
+    """跨月冲回的来源月未发布：整月不发布；先发布来源月再重试。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    add_month(client, "2027-01")
+    post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A1,S1,CC-B,1200\n")
+    open_close(client, "2027-01")
+
+    resp = publish(client, "2027-01", MAP_HEADER + "CC-B,丙公司\n")
+    text = resp.data.decode("utf-8")
+    assert "整月未发布" in text and "尚未发布" in text and "2026-12" in text
+    assert q(client.db_path, "SELECT * FROM publications WHERE month='2027-01'") == []
+
+    publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\n")
+    resp = publish(client, "2027-01", MAP_HEADER + "CC-B,丙公司\n")
+    assert "已发布" in resp.data.decode("utf-8")
+
+
+def test_publish_source_later_than_month_blocks(client):
+    """来源流水入账月晚于本月（数据异常）：指出受影响流水，整月不发布。"""
+    add_month(client, "2027-01")
+    add_month(client, "2027-02")
+    conn = sqlite3.connect(client.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO postings(entry_month, slip_no, slip_month, kind,"
+            " cost_center, amount_cents, adjust_no, revision, created_at) VALUES"
+            " ('2027-01','SX','2027-01','reverse','CC-A',-100,'A9',2,'now')")
+        conn.execute(
+            "INSERT INTO postings(entry_month, slip_no, slip_month, kind,"
+            " cost_center, amount_cents, adjust_no, revision, created_at) VALUES"
+            " ('2027-02','SX','2027-01','rebook','CC-B',100,'A9',1,'now')")
+        conn.commit()
+    finally:
+        conn.close()
+    open_close(client, "2027-01")
+    open_close(client, "2027-02")
+    resp = publish(client, "2027-01", MAP_HEADER + "CC-A,甲公司\n")
+    text = resp.data.decode("utf-8")
+    assert "整月未发布" in text and "晚于本月" in text
+    assert q(client.db_path, "SELECT * FROM publications") == []
+
+
+def test_reupload_after_publish_returns_published_file(client):
+    """首次发布成功后，重传对照只提供已发布的文件，结果不变。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    open_close(client, "2026-12")
+    publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\n")
+    before = client.get("/month/2026-12/warehouse.csv").data.decode("utf-8")
+
+    # 重传一份不同的对照：响应就是已发布文件本身
+    resp = client.post(
+        "/month/2026-12/publish",
+        data={"file": (io.BytesIO((MAP_HEADER + "CC-A,乙公司\n").encode("utf-8")), "m.csv")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200
+    assert resp.data.decode("utf-8") == before
+    assert "乙公司" not in before
+    assert len(q(client.db_path, "SELECT * FROM publications")) == 1
+    assert q(client.db_path, "SELECT legal_entity FROM publication_rows")[0]["legal_entity"] == "甲公司"
+
+
+def test_publish_empty_closed_month(client):
+    add_month(client, "2026-12")
+    open_close(client, "2026-12")
+    resp = publish(client, "2026-12", MAP_HEADER + "CC-A,甲公司\n")
+    assert "已发布" in resp.data.decode("utf-8")
+    assert warehouse_lines(client, "2026-12") == [
+        "入账月,薪资单号,薪资所属月,流水类型,成本中心,金额分,勘误号,修订号,法人"]
+
+
+def test_publish_reverse_after_inplace_uses_final_original(client):
+    """未封账原地改过的原行，封账发布后再勘误：冲回沿用原行发布时的法人。"""
+    add_month(client, "2026-12")
+    post_csv(client, "/import/originals", "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    post_csv(client, "/import/adjustments", "2026-12", ADJ_HEADER + "A1,S1,CC-B,1100\n")
+    open_close(client, "2026-12")
+    publish(client, "2026-12", MAP_HEADER + "CC-B,乙公司\n")  # 原行已是 CC-B/rev1
+
+    add_month(client, "2027-01")
+    post_csv(client, "/import/adjustments", "2027-01", ADJ_HEADER + "A2,S1,CC-C,900\n")
+    open_close(client, "2027-01")
+    publish(client, "2027-01", MAP_HEADER + "CC-C,丙公司\n")
+
+    lines = warehouse_lines(client, "2027-01")
+    rev = [ln for ln in lines if ",冲回," in ln][0]
+    assert ",CC-B," in rev and rev.endswith(",乙公司")
+
+
+def test_concurrent_publish_only_one_effective(tmp_path):
+    """并发发布同一月份：只有一份生效，另一份得到已发布结果。"""
+    import threading
+
+    db = str(tmp_path / "pub.db")
+    appmod.init_db(db)
+    conn = appmod.connect(db)
+    appmod.open_month(conn, "2026-12")
+    appmod.ingest_originals(conn, "2026-12", ORIG_HEADER + "S1,CC-A,1000\n")
+    appmod.close_month(conn, "2026-12")
+    conn.close()
+
+    body = MAP_HEADER + "CC-A,甲公司\n"
+    results, errors = [], []
+    barrier = threading.Barrier(2)
+
+    def worker():
+        c = appmod.connect(db)
+        try:
+            barrier.wait()
+            results.append(appmod.publish_month(c, "2026-12", body)[0])
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            c.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    assert sorted(results) == ["already", "published"]
+    assert len(q(db, "SELECT * FROM publications")) == 1
+    assert len(q(db, "SELECT * FROM publication_rows")) == 1
